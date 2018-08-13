@@ -41,26 +41,26 @@ Puppet::Type.type(:xml_fragment).provide(:xml_fragment) do
 
 				# Mark each of the nodes to note that we don't delete them
 				found.each do |node|
-					node.add_attribute("Puppet::Util::XmlFile.Managed", true)
+					node.set_attribute("Puppet::Util::XmlFile.Managed", true)
 				end
 			end
 
-			# Iterate through the purge parents and remove immediate children that are no managed			
+			# Iterate through the purge parents and remove immediate children that are not managed			
 			purgeParents.each do |p|
 				matches = self.class.tag_regex.match(p[:xpath])		
 				parent_xpath = matches[1]
 				tag_name = matches[2]
 
-				removedElements = file.remove_elements("#{parent_xpath}/#{tag_name}/*[not(@Puppet::Util::XmlFile.Managed)]")			
+				removedElements = file.remove_elements("#{parent_xpath}/#{tag_name}")			
 
-				if removedElements.length > 0
+				if !removedElements.empty?
 					Puppet.notice("Removing unmanaged elements #{p[:xpath]}")
 				end
 			end		
 
 			# Remove the attributes that we added
 			managed.each do |node|
-				node.delete_attribute("Puppet::Util::XmlFile.Managed")
+				node.remove_attribute("Puppet::Util::XmlFile.Managed")
 			end
 
 			file.save()		
@@ -143,7 +143,7 @@ Puppet::Type.type(:xml_fragment).provide(:xml_fragment) do
 		file = self.class.xml_fragment_classvars[:read_only][resource[:path]]
 
 		# Check to see if the fragment exists in the xml file
-		file.file_exists && file.exists(@parent_xpath, @tag_name, @tag_xpath)	
+		file.file_exists && file.exists(resource[:xpath])
 	end
 
 	def create

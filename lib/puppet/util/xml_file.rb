@@ -1,35 +1,17 @@
-require "rexml/document"
-
-# Override the REXML pretty printer to prevent text wrapping
-class MyPrecious < REXML::Formatters::Pretty
-    def write_text( node, output )
-        s = node.to_s()
-        s.gsub!(/\s/,' ')
-        s.squeeze!(" ")
-
-        #The Pretty formatter code mistakenly used 80 instead of the @width variable
-        #s = wrap(s, 80-@level)
-        s = wrap(s, @width-@level)
-
-        s = indent_text(s, @level, " ", true)
-        output << (' '*@level + s)
-    end
-end
+require "nokogiri"
 
 module Puppet
 module Util
 	class XmlFile		
 		def initialize(path)
 			@does_exist = false
-			@document = REXML::Document.new
 			@path = path
 
 			if File.file?(@path)
 				@does_exist = true
-
-				File.open(@path, 'r') do |file_contents|
-					@document = REXML::Document.new(file_contents)
-				end
+				xml_file = File.open(@path, 'r')
+				# We remove namespaces to avoid xpath requiring them during searches
+				@document =  Nokogiri::XML(xml_file,&:noblanks).remove_namespaces!
 			end		
 		end
 
@@ -39,7 +21,7 @@ module Util
 
 		# Find all nodes for a give URI
 		def find(xpath)
-			REXML::XPath.match(@document, xpath)
+			@document.xpath(xpath)
 		end
 
 		def matches(xpath, value)
@@ -47,7 +29,7 @@ module Util
 
 			candidates = find(xpath)
 
-			if candidates.length > 0
+			if !candidates.empty?
 				candidates.each do |node|
 					if !node_matches(node, value)
 						does_match = false
@@ -62,22 +44,25 @@ module Util
 		end
 
 		def node_matches(node, value)
+			if !node || node.empty?
+				return false
+			end
 			# Is this a text only node?
-			if !node.has_elements?
+			if node.type == 3
 				if value && value.has_key?("value") && value["value"] != "" && node.text != value["value"]
 					return false
 				end
 			end
 
-			if value.has_key?("attributes") && node.has_attributes?()
+			if value.has_key?("attributes") && node.has_attribute?
 				value["attributes"].each do |key, value|
-					test_attribute = node.attributes.get_attribute(key)
+					test_attribute = node.attribute(key)
 
-					if !test_attribute || test_attribute.value() != value
+					if !test_attribute || test_attribute.value != value
 						return false											
 					end
 				end							
-			elsif value.has_key?("attributes") != node.has_attributes?()
+			elsif value.has_key?("attributes") != node.has_attribute?
 				return false
 			end
 
@@ -85,92 +70,113 @@ module Util
 		end
 
 		def remove_elements(xpath)
-			Puppet.debug "Removing elements for #{xpath}"
-			@document.root.elements.delete_all(xpath)
-		end
-
-		def exists(xpath, tag, tag_xpath)
-			parent_found = false
-			does_exist = true
-
-			REXML::XPath.each(@document, xpath) do |parent|
-				parent_found = true
-				if REXML::XPath.match(parent, "./#{tag}#{tag_xpath}").length == 0
-					does_exist = false
-					break
+			nodes = @document.xpath(xpath)
+			nodes.each do |node|
+				node.children.each do |child|
+					if !child.attribute("Puppet::Util::XmlFile.Managed")
+						Puppet.debug "Removing unmanaged node #{child}"
+						child.remove
+					end
 				end
 			end
-
-			does_exist && parent_found
+			nodes
 		end
 
-		def set_tag(xpath, tag, tag_xpath, value)
+		def exists(xpath)
+			!@document.xpath(xpath).empty?
+		end
+
+		def create_xml(xpath, tag, content)
+			nodes = xpath.split("/")
+			if nodes[0] == ""
+				nodes = nodes.drop(1)
+			end
+
+			nodes.push(tag)
+			builder = Nokogiri::XML::Builder.new do |xml|
+				recursor = ->(*) do
+					if nodes.size > 1
+						xml.send(nodes.shift, &recursor)
+					else
+						# send tag with content
+						xml.send(nodes.shift, content)
+					end
+				end
+				recursor.call
+			end
+			xml_file = File.new(@path, "w")
+			xml_file.write(builder.to_xml)
+			xml_file.close
+			xml_file = File.open(@path, 'r')
+			@document =  Nokogiri::XML(xml_file,&:noblanks).remove_namespaces!
+		end
+
+		def set_tag(parent_xpath, tag, tag_xpath, value)
+			if !@document
+				return create_xml(parent_xpath, tag, value)
+			end
 			matches = nil
 			parent_found = false
 			
-			Puppet.notice("Xpath: #{xpath}")
+			Puppet.notice("Xpath: #{parent_xpath}")
 
-			REXML::XPath.each(@document, xpath) do |node|				
-				if node.is_a?(REXML::Element)
+			@document.xpath(parent_xpath).each do |node|
+				if node.element?
 					was_found = false
 					parent_found = true
 					
-					REXML::XPath.each(node, "./#{tag}#{tag_xpath}") do |child|
+					node.xpath("./#{tag}#{tag_xpath}").each do |child|
 						was_found = true
-												
+
 						if value && value.has_key?("value")
-							child.text = value["value"]
+							child.content = value["value"]
 						end
 						
 						if value && value.has_key?("attributes")
 							value["attributes"].each do |key, value|
-								child.attributes[key] = value
+								child.set_attribute(key, value)
 							end
 						end					
 					end			
 
 					if !was_found												
-						new_element = REXML::Element.new(tag)
+						new_element = Nokogiri::XML::Node.new(tag, @document)
 						
 						if value.has_key?("value")
-							new_element.text = value["value"]
+							new_element.content = value["value"]
 						end
 						
 						if value.has_key?("attributes")
 							new_element.add_attributes(value["attributes"])
 						end						
 
-						node.add_element(new_element)
+						node.add_child(new_element)
 					end
 				end
 			end
 
-			raise ArgumentError, "Unable to set <#{tag}>. No parents found for the xpath #{xpath}" if !parent_found
+			raise ArgumentError, "Unable to set <#{tag}>. No parents found for the xpath #{parent_xpath}" if !parent_found
 		end
 
 		def remove_tag(xpath)			
-			@document.elements.delete_all(xpath)							
+			@document.xpath(xpath).each do |node|
+				node.remove
+			end				
 		end
 
 		def save
-			File.open(@path, 'w') do |file_contents|
-				formatter = MyPrecious.new
-				formatter.width = 10000
-				formatter.compact = true
-				formatter.write(@document, file_contents)
-				#@document.write(file_contents)
-			end
+			File.write(@path, @document.to_xml)
 		end
 
 		# Static helper methods
 		def self.node_to_hash(node)
 			new_hash = Hash.new
 
-			if !node.has_elements? && node.text && node.text != ""
+			if node.element_children.empty? && node.text && node.text != ""
 				new_hash["value"] = node.text
 			end
 
-			if node.has_attributes?
+			if !node.attributes.empty?
 				new_hash["attributes"] = Hash.new
 				
 				node.attributes.each do |a|
